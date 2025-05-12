@@ -1,5 +1,13 @@
 # MCP Atlassian
 
+> **¡Disponible como imagen Docker!**
+>
+> Puedes obtener la última versión ejecutando:
+>
+> ```bash
+> docker pull ghcr.io/imgabo/mcp-atlassian-devarq:latest
+> ```
+
 Este proyecto es una integración personalizada que desarrollé para conectar productos de Atlassian (Confluence y Jira) con asistentes de inteligencia artificial y flujos de trabajo automatizados. Está pensado para facilitar la gestión y consulta de información en entornos empresariales que utilizan Atlassian, tanto en la nube como en instalaciones propias (Server/Data Center).
 
 ## ¿Qué puedes hacer con MCP Atlassian?
