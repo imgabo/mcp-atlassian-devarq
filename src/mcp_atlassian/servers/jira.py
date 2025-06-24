@@ -3,6 +3,8 @@
 import json
 import logging
 from typing import Annotated, Any
+import os
+import base64
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -20,6 +22,45 @@ jira_mcp = FastMCP(
     description="Provides tools for interacting with Atlassian Jira.",
 )
 
+VOLUME_PATH = "/mnt/archivos"
+
+@jira_mcp.tool(tags={"jira", "read"})
+async def list_volume_files(
+    ctx: Context,
+) -> str:
+    """
+    List all files in the mounted volume directory (/mnt/archivos).
+    Returns a JSON string with a list of relative file paths.
+    """
+    files = []
+    for root, dirs, filenames in os.walk(VOLUME_PATH):
+        for filename in filenames:
+            rel_path = os.path.relpath(os.path.join(root, filename), VOLUME_PATH)
+            files.append(rel_path)
+    return json.dumps({"files": files}, indent=2, ensure_ascii=False)
+
+@jira_mcp.tool(tags={"jira", "read"})
+async def read_volume_file(
+    ctx: Context,
+    filename: Annotated[str, Field(description="Relative path of the file inside /mnt/archivos")],
+) -> str:
+    """
+    Read the content of a file in the mounted volume directory (/mnt/archivos).
+    Returns the content as text if possible, or as base64 if binary.
+    """
+    file_path = os.path.abspath(os.path.join(VOLUME_PATH, filename))
+    if not file_path.startswith(VOLUME_PATH):
+        return json.dumps({"error": "Invalid file path."}, indent=2, ensure_ascii=False)
+    if not os.path.exists(file_path):
+        return json.dumps({"error": "File not found."}, indent=2, ensure_ascii=False)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return json.dumps({"filename": filename, "content": content}, indent=2, ensure_ascii=False)
+    except UnicodeDecodeError:
+        with open(file_path, "rb") as f:
+            content = base64.b64encode(f.read()).decode("utf-8")
+        return json.dumps({"filename": filename, "content_base64": content}, indent=2, ensure_ascii=False)
 
 @jira_mcp.tool(tags={"jira", "read"})
 async def get_user_profile(
@@ -1722,3 +1763,56 @@ async def bulk_delete_comments(
         "issue_key": issue_key,
     }
     return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "write"})
+async def create_issue_from_volume_file(
+    ctx: Context,
+    project_key: Annotated[str, Field(description="Jira project key (e.g., 'PROJ')")],
+    issue_type: Annotated[str, Field(description="Issue type (e.g., 'Task', 'Story')")],
+    filename: Annotated[str, Field(description="Relative path of the file inside /mnt/archivos")],
+    assignee: Annotated[str, Field(description="(Optional) Assignee's user identifier", default="")] = "",
+    components: Annotated[str, Field(description="(Optional) Comma-separated list of component names", default="")] = "",
+) -> str:
+    """
+    Crea un issue en Jira usando el contenido de un archivo del volumen y adjunta el archivo.
+    La primera línea del archivo será el summary, el resto la descripción.
+    """
+    VOLUME_PATH = "/mnt/archivos"
+    import os
+    import base64
+    file_path = os.path.abspath(os.path.join(VOLUME_PATH, filename))
+    if not file_path.startswith(VOLUME_PATH):
+        return json.dumps({"success": False, "error": "Invalid file path."}, indent=2, ensure_ascii=False)
+    if not os.path.exists(file_path):
+        return json.dumps({"success": False, "error": "File not found."}, indent=2, ensure_ascii=False)
+    # Leer archivo (texto o binario)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if not lines:
+            return json.dumps({"success": False, "error": "File is empty."}, indent=2, ensure_ascii=False)
+        summary = lines[0].strip()
+        description = "".join(lines[1:]).strip() if len(lines) > 1 else ""
+    except UnicodeDecodeError:
+        # Si es binario, no se puede extraer summary/description
+        return json.dumps({"success": False, "error": "File is not a text file."}, indent=2, ensure_ascii=False)
+    # Crear issue
+    lifespan_ctx = ctx.request_context.lifespan_context
+    if not lifespan_ctx or not lifespan_ctx.jira:
+        return json.dumps({"success": False, "error": "Jira client is not configured or available."}, indent=2, ensure_ascii=False)
+    jira = lifespan_ctx.jira
+    issue = jira.create_issue(
+        project_key=project_key,
+        summary=summary,
+        issue_type=issue_type,
+        assignee=assignee,
+        description=description,
+        components=components,
+    )
+    result = issue.to_simplified_dict()
+    return json.dumps(
+        {"message": "Issue created successfully", "issue": result},
+        indent=2,
+        ensure_ascii=False,
+    )
