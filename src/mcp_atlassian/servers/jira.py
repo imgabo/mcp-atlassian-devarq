@@ -5,6 +5,8 @@ import logging
 from typing import Annotated, Any
 import os
 import base64
+import shutil
+import tempfile
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -1791,44 +1793,149 @@ async def create_issue_from_volume_file(
     components: Annotated[str, Field(description="(Optional) Comma-separated list of component names", default="")] = "",
 ) -> str:
     """
-    Crea un issue en Jira usando el contenido de un archivo del volumen y adjunta el archivo.
-    La primera línea del archivo será el summary, el resto la descripción.
+    Crea un issue en Jira usando el contenido de un archivo del volumen y adjunta el archivo y sus imágenes embebidas.
+    Soporta .docx, .pdf y texto plano. Extrae imágenes y las referencia en la descripción.
     """
-    VOLUME_PATH = "/mnt/archivos"
     import os
     import base64
+    import shutil
+    import tempfile
+    VOLUME_PATH = "/mnt/archivos"
     file_path = os.path.abspath(os.path.join(VOLUME_PATH, filename))
     if not file_path.startswith(VOLUME_PATH):
         return json.dumps({"success": False, "error": "Invalid file path."}, indent=2, ensure_ascii=False)
     if not os.path.exists(file_path):
         return json.dumps({"success": False, "error": "File not found."}, indent=2, ensure_ascii=False)
-    # Leer archivo (texto o binario)
+
+    # Variables para resultado
+    summary = ""
+    description_parts = []
+    image_files = []
+    temp_dir = tempfile.mkdtemp(dir=VOLUME_PATH)
+    error = None
+
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if not lines:
-            return json.dumps({"success": False, "error": "File is empty."}, indent=2, ensure_ascii=False)
-        summary = lines[0].strip()
-        description = "".join(lines[1:]).strip() if len(lines) > 1 else ""
-    except UnicodeDecodeError:
-        # Si es binario, no se puede extraer summary/description
-        return json.dumps({"success": False, "error": "File is not a text file."}, indent=2, ensure_ascii=False)
-    # Crear issue
-    lifespan_ctx = ctx.request_context.lifespan_context
-    if not lifespan_ctx or not lifespan_ctx.jira:
-        return json.dumps({"success": False, "error": "Jira client is not configured or available."}, indent=2, ensure_ascii=False)
-    jira = lifespan_ctx.jira
-    issue = jira.create_issue(
-        project_key=project_key,
-        summary=summary,
-        issue_type=issue_type,
-        assignee=assignee,
-        description=description,
-        components=components,
-    )
-    result = issue.to_simplified_dict()
-    return json.dumps(
-        {"message": "Issue created successfully", "issue": result},
-        indent=2,
-        ensure_ascii=False,
-    )
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".docx":
+            from docx import Document
+            from docx.document import Document as _Document
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+            def iter_block_items(parent):
+                if isinstance(parent, _Document):
+                    parent_elm = parent.element.body
+                else:
+                    parent_elm = parent._tc
+                for child in parent_elm.iterchildren():
+                    if child.tag.endswith('}p'):
+                        yield Paragraph(child, parent)
+                    elif child.tag.endswith('}tbl'):
+                        yield Table(child, parent)
+            doc = Document(file_path)
+            img_count = 0
+            rels = {r.rId: r for r in doc.part.rels.values() if "image" in r.target_ref}
+            img_map = {}
+            # Mapear imágenes a su nombre temporal
+            for rId, rel in rels.items():
+                img_count += 1
+                img_data = rel.target_part.blob
+                img_name = f"{os.path.splitext(os.path.basename(filename))[0]}_img{img_count}.png"
+                img_path = os.path.join(temp_dir, img_name)
+                with open(img_path, "wb") as img_file:
+                    img_file.write(img_data)
+                img_map[rId] = img_name
+                image_files.append(img_path)
+            # Recorrer bloques en orden
+            for block in iter_block_items(doc):
+                if isinstance(block, Paragraph):
+                    text = block.text.strip()
+                    if text:
+                        description_parts.append(text)
+                    # Buscar imágenes en los runs
+                    for run in block.runs:
+                        if run.element.xpath('.//a:blip'):
+                            for blip in run.element.xpath('.//a:blip'):
+                                rEmbed = blip.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                                if rEmbed and rEmbed in img_map:
+                                    description_parts.append(f"!{img_map[rEmbed]}!")
+                elif isinstance(block, Table):
+                    description_parts.append("[Tabla detectada]")
+            summary = description_parts[0] if description_parts else os.path.basename(filename)
+            description = "\n\n".join(description_parts[1:]) if len(description_parts) > 1 else ""
+        elif ext == ".pdf":
+            import fitz  # PyMuPDF
+            doc = fitz.open(file_path)
+            img_count = 0
+            text_parts = []
+            image_refs = []
+            for page_num, page in enumerate(doc, 1):
+                text = page.get_text().strip()
+                if text:
+                    text_parts.append(text)
+                for img_index, img in enumerate(page.get_images(full=True)):
+                    xref = img[0]
+                    base_img = doc.extract_image(xref)
+                    img_bytes = base_img["image"]
+                    img_ext = base_img["ext"]
+                    img_name = f"{os.path.splitext(os.path.basename(filename))[0]}_p{page_num}_img{img_index+1}.{img_ext}"
+                    img_path = os.path.join(temp_dir, img_name)
+                    with open(img_path, "wb") as img_file:
+                        img_file.write(img_bytes)
+                    image_files.append(img_path)
+                    image_refs.append(f"!{img_name}!")
+            summary = text_parts[0].splitlines()[0] if text_parts and text_parts[0] else os.path.basename(filename)
+            description = "\n\n".join(text_parts)
+            # Agregar referencias a imágenes al final
+            if image_refs:
+                description += "\n\n" + "\n\n".join(image_refs)
+        else:
+            # Solo intentar abrir como texto si es .txt, .md, .csv
+            if ext in [".txt", ".md", ".csv"]:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                summary = lines[0].strip() if lines else os.path.basename(filename)
+                description = "".join(lines[1:]).strip() if len(lines) > 1 else ""
+            else:
+                raise Exception("Formato de archivo no soportado para extracción automática. Usa .docx, .pdf, .txt, .md, .csv.")
+        # Construir descripción final (texto + imágenes)
+        if description_parts:
+            description = "\n\n".join(description_parts)
+        # Convertir a Wiki Markup
+        lifespan_ctx = ctx.request_context.lifespan_context
+        if not lifespan_ctx or not lifespan_ctx.jira:
+            raise Exception("Jira client is not configured or available.")
+        jira = lifespan_ctx.jira
+        description_wiki = jira.markdown_to_jira(description) if description else ""
+        # Crear issue
+        components_list = [c.strip() for c in components.split(",") if c.strip()] if components else None
+        issue = jira.create_issue(
+            project_key=project_key,
+            summary=summary,
+            issue_type=issue_type,
+            description=description_wiki,
+            assignee=assignee,
+            components=components_list,
+        )
+        issue_key = getattr(issue, "key", None) or (issue.get("key") if isinstance(issue, dict) else None)
+        if not issue_key:
+            raise Exception("Failed to create issue.")
+        # Subir attachments (imágenes extraídas)
+        attachment_results = []
+        for img_path in image_files:
+            result = jira.upload_attachment(issue_key=issue_key, file_path=img_path)
+            attachment_results.append(result)
+        # Limpiar archivos temporales
+        shutil.rmtree(temp_dir)
+        return json.dumps({
+            "success": True,
+            "issue": issue.to_simplified_dict() if hasattr(issue, "to_simplified_dict") else issue,
+            "attachments": attachment_results
+        }, indent=2, ensure_ascii=False)
+    except Exception as e:
+        error = str(e)
+        # Limpiar archivos temporales si hubo error
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
+        return json.dumps({"success": False, "error": error}, indent=2, ensure_ascii=False)
