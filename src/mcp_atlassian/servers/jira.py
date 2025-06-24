@@ -46,13 +46,26 @@ async def read_volume_file(
 ) -> str:
     """
     Read the content of a file in the mounted volume directory (/mnt/archivos).
-    Returns the content as text if possible, or as base64 if binary.
+    Returns the content as text if possible, or as base64 if binary. Si es PDF, extrae el texto.
     """
     file_path = os.path.abspath(os.path.join(VOLUME_PATH, filename))
     if not file_path.startswith(VOLUME_PATH):
         return json.dumps({"error": "Invalid file path."}, indent=2, ensure_ascii=False)
     if not os.path.exists(file_path):
         return json.dumps({"error": "File not found."}, indent=2, ensure_ascii=False)
+    # Si es PDF, extraer texto
+    if file_path.lower().endswith(".pdf"):
+        try:
+            import PyPDF2
+            with open(file_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text() or ""
+            return json.dumps({"filename": filename, "content": text}, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to extract PDF text: {str(e)}"}, indent=2, ensure_ascii=False)
+    # Si es texto plano
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -802,11 +815,14 @@ async def create_issue(
     if not isinstance(extra_fields, dict):
         raise ValueError("additional_fields must be a dictionary.")
 
+    # Convert description to Wiki Markup (Jira format)
+    description_wiki = jira.markdown_to_jira(description) if description else ""
+
     issue = jira.create_issue(
         project_key=project_key,
         summary=summary,
         issue_type=issue_type,
-        description=description,
+        description=description_wiki,
         assignee=assignee,
         components=components_list,
         **extra_fields,
