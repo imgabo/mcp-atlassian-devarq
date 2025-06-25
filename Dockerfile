@@ -1,6 +1,9 @@
 # Use a Python image with uv pre-installed
 FROM ghcr.io/astral-sh/uv:python3.10-alpine AS uv
 
+# Instala libstdc++ para soporte de PyMuPDF/fitz
+RUN apk add --no-cache libstdc++
+
 # Install the project into `/app`
 WORKDIR /app
 
@@ -34,6 +37,9 @@ RUN find /app/.venv -name '__pycache__' -type d -exec rm -rf {} + && \
 
 # Final stage
 FROM python:3.10-alpine
+
+# Instala libstdc++ para soporte de PyMuPDF/fitz
+RUN apk add --no-cache libstdc++
 
 # Create a non-root user 'app'
 RUN adduser -D -h /home/app -s /bin/sh app

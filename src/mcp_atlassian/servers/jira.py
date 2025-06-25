@@ -7,6 +7,11 @@ import os
 import base64
 import shutil
 import tempfile
+import openpyxl
+import csv
+import fitz  # PyMuPDF
+import re
+import requests
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -1863,7 +1868,6 @@ async def create_issue_from_volume_file(
             summary = description_parts[0] if description_parts else os.path.basename(filename)
             description = "\n\n".join(description_parts[1:]) if len(description_parts) > 1 else ""
         elif ext == ".pdf":
-            import fitz  # PyMuPDF
             doc = fitz.open(file_path)
             img_count = 0
             text_parts = []
@@ -1888,15 +1892,122 @@ async def create_issue_from_volume_file(
             # Agregar referencias a imágenes al final
             if image_refs:
                 description += "\n\n" + "\n\n".join(image_refs)
-        else:
-            # Solo intentar abrir como texto si es .txt, .md, .csv
-            if ext in [".txt", ".md", ".csv"]:
+        elif ext in [".txt", ".md", ".csv"]:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            summary = lines[0].strip() if lines else os.path.basename(filename)
+            description = "".join(lines[1:]).strip() if len(lines) > 1 else ""
+        elif ext == ".xlsx":
+            try:
+                wb = openpyxl.load_workbook(file_path, data_only=True)
+                sheet_texts = []
+                for sheet in wb.worksheets:
+                    rows = list(sheet.iter_rows(values_only=True))
+                    if not rows:
+                        continue
+                    # Encabezados
+                    headers = [str(h) if h is not None else "" for h in rows[0]]
+                    # Filas
+                    table_lines = ["| " + " | ".join(headers) + " |"]
+                    table_lines.append("|" + "|".join(["---"] * len(headers)) + "|")
+                    for row in rows[1:]:
+                        row_cells = [str(cell) if cell is not None else "" for cell in row]
+                        table_lines.append("| " + " | ".join(row_cells) + " |")
+                    sheet_text = f"### Hoja: {sheet.title}\n" + "\n".join(table_lines)
+                    sheet_texts.append(sheet_text)
+                summary = os.path.basename(filename)
+                description = "\n\n".join(sheet_texts)
+            except Exception as e:
+                raise Exception(f"Error al leer archivo .xlsx: {e}")
+        elif ext in [".csv", ".xlsx"]:
+            # Heurística de mapeo de campos
+            FIELD_KEYWORDS = {
+                "summary": ["nombre hu", "título", "summary", "resumen", "titulo"],
+                "assignee": ["asignado", "responsable", "assignee"],
+                "priority": ["prioridad", "priority"],
+                "labels": ["etiqueta", "labels"],
+                "duedate": ["fecha de vencimiento", "due date", "vencimiento"],
+                "storypoints": ["story point", "puntos", "puntos de historia"],
+                "status": ["estado", "status"],
+            }
+            def guess_jira_field(header):
+                header_lower = header.strip().lower()
+                for jira_field, keywords in FIELD_KEYWORDS.items():
+                    if any(kw in header_lower for kw in keywords):
+                        return jira_field
+                return None
+            # Leer datos
+            rows = []
+            headers = []
+            if ext == ".csv":
                 with open(file_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                summary = lines[0].strip() if lines else os.path.basename(filename)
-                description = "".join(lines[1:]).strip() if len(lines) > 1 else ""
-            else:
-                raise Exception("Formato de archivo no soportado para extracción automática. Usa .docx, .pdf, .txt, .md, .csv.")
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader):
+                        if i == 0:
+                            headers = [str(h).strip() for h in row]
+                        else:
+                            rows.append(row)
+            else:  # .xlsx
+                wb = openpyxl.load_workbook(file_path, data_only=True)
+                sheet = wb.active
+                for i, row in enumerate(sheet.iter_rows(values_only=True)):
+                    if i == 0:
+                        headers = [str(h).strip() if h is not None else "" for h in row]
+                    else:
+                        rows.append([str(cell) if cell is not None else "" for cell in row])
+            # Mapeo de columnas
+            col_map = {}
+            for idx, h in enumerate(headers):
+                field = guess_jira_field(h)
+                if field:
+                    col_map[field] = idx
+            if "summary" not in col_map:
+                return json.dumps({"success": False, "error": "No se encontró columna de resumen (summary) en el archivo."}, indent=2, ensure_ascii=False)
+            # Preparar Jira client
+            lifespan_ctx = ctx.request_context.lifespan_context
+            if not lifespan_ctx or not lifespan_ctx.jira:
+                raise Exception("Jira client is not configured or available.")
+            jira = lifespan_ctx.jira
+            results = []
+            for row in rows:
+                try:
+                    summary = row[col_map["summary"]].strip() if row[col_map["summary"]] else ""
+                    if not summary:
+                        continue
+                    assignee = row[col_map["assignee"]].strip() if "assignee" in col_map and row[col_map["assignee"]] else ""
+                    priority = row[col_map["priority"]].strip() if "priority" in col_map and row[col_map["priority"]] else ""
+                    labels = row[col_map["labels"]].strip() if "labels" in col_map and row[col_map["labels"]] else ""
+                    duedate = row[col_map["duedate"]].strip() if "duedate" in col_map and row[col_map["duedate"]] else ""
+                    storypoints = row[col_map["storypoints"]].strip() if "storypoints" in col_map and row[col_map["storypoints"]] else ""
+                    # status no se puede setear directo al crear, pero se puede guardar para referencia
+                    additional_fields = {}
+                    if priority:
+                        additional_fields["priority"] = {"name": priority}
+                    if labels:
+                        additional_fields["labels"] = [l.strip() for l in labels.split(",") if l.strip()]
+                    if duedate:
+                        additional_fields["duedate"] = duedate
+                    if storypoints and storypoints.isdigit():
+                        additional_fields["customfield_10016"] = int(storypoints)  # Ajusta el ID según tu Jira
+                    issue = jira.create_issue(
+                        project_key=project_key,
+                        summary=summary,
+                        issue_type=issue_type,
+                        assignee=assignee,
+                        description="",
+                        **additional_fields
+                    )
+                    results.append({"success": True, "issue": issue.to_simplified_dict() if hasattr(issue, "to_simplified_dict") else issue, "row": summary})
+                except Exception as e:
+                    results.append({"success": False, "error": str(e), "row": row})
+            return json.dumps({"results": results}, indent=2, ensure_ascii=False)
+        elif ext in [".txt", ".md"]:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            summary = lines[0].strip() if lines else os.path.basename(filename)
+            description = "".join(lines[1:]).strip() if len(lines) > 1 else ""
+        else:
+            raise Exception("Formato de archivo no soportado para extracción automática. Usa .docx, .pdf, .txt, .md, .csv, .xlsx.")
         # Construir descripción final (texto + imágenes)
         if description_parts:
             description = "\n\n".join(description_parts)
@@ -1939,3 +2050,115 @@ async def create_issue_from_volume_file(
         except Exception:
             pass
         return json.dumps({"success": False, "error": error}, indent=2, ensure_ascii=False)
+
+@jira_mcp.tool(tags={"jira", "write"})
+async def clone_issue_with_attachments_and_links(
+    ctx: Context,
+    source_issue_key: Annotated[str, Field(description="Key de la tarea a clonar (ej: AT-2)")],
+    target_project_key: Annotated[str, Field(description="Proyecto destino (ej: AT)")],
+    summary_prefix: Annotated[str, Field(description="Prefijo opcional para el resumen", default="CLONE - ")] = "CLONE - "
+) -> str:
+    """
+    Clona una tarea de Jira (issue) incluyendo descripción, adjuntos, enlaces y comentarios (con autor y fecha original).
+    """
+ 
+    lifespan_ctx = ctx.request_context.lifespan_context
+    if not lifespan_ctx or not lifespan_ctx.jira:
+        raise Exception("Jira client is not configured or available.")
+    jira = lifespan_ctx.jira
+    # 1. Obtener datos del issue original
+    orig_issue = jira.get_issue(issue_key=source_issue_key, fields="*all", expand="attachment,renderedFields")
+    orig_data = orig_issue.to_simplified_dict() if hasattr(orig_issue, "to_simplified_dict") else orig_issue
+    summary = orig_data.get("summary", "")
+    description = orig_data.get("description", "")
+    # Buscar imágenes embebidas en la descripción (!nombre.png! o !nombre.png|...!)
+    embedded_images = set()
+    for match in re.finditer(r"!([^!|]+)(?:\|[^!]*)?!", description):
+        fname = match.group(1)
+        embedded_images.add(fname)
+    # 2. Crear el nuevo issue (sin adjuntos aún)
+    new_summary = f"{summary_prefix}{summary}"
+    new_issue = jira.create_issue(
+        project_key=target_project_key,
+        summary=new_summary,
+        issue_type=orig_data.get("issuetype", {}).get("name", "Task"),
+        description=description,
+        assignee=orig_data.get("assignee", {}).get("accountId", "")
+    )
+    new_issue_key = getattr(new_issue, "key", None) or (new_issue.get("key") if isinstance(new_issue, dict) else None)
+    # 3. Descargar adjuntos usando la tool download_attachments
+    temp_dir = tempfile.mkdtemp()
+    attachment_results = []
+    attachment_files = []
+    attachment_names = []
+    try:
+        from src.mcp_atlassian.servers.jira import download_attachments
+        download_json = await download_attachments(ctx, source_issue_key, temp_dir)
+        download_result = json.loads(download_json)
+        attachments = download_result.get('attachments', []) if isinstance(download_result, dict) else []
+        for att in attachments:
+            file_path = att.get('file_path')
+            filename = att.get('filename')
+            if file_path and filename:
+                attachment_files.append(file_path)
+                attachment_names.append(filename)
+                attachment_results.append({"filename": filename, "success": True})
+    except Exception as e:
+        attachment_results.append({"error": str(e)})
+    # 4. Subir adjuntos al nuevo issue
+    uploaded_attachments = []
+    for file_path in attachment_files:
+        try:
+            result = jira.upload_attachment(issue_key=new_issue_key, file_path=file_path)
+            uploaded_attachments.append(result)
+        except Exception as e:
+            uploaded_attachments.append({"file": file_path, "error": str(e)})
+    # 5. Replicar enlaces (solo issue links, no web links directos)
+    issue_links = []
+    web_links = []
+    if "issuelinks" in orig_data:
+        issue_links = orig_data["issuelinks"]
+    if "issuelinks" in orig_data.get("fields", {}):
+        issue_links = orig_data["fields"]["issuelinks"]
+    if "issuelinks" in orig_data:
+        for link in orig_data["issuelinks"]:
+            if "webLink" in link:
+                web_links.append(link["webLink"])
+    link_results = []
+    for link in issue_links:
+        try:
+            link_type = link.get("type", {}).get("name")
+            inward = link.get("inwardIssue", {}).get("key")
+            outward = link.get("outwardIssue", {}).get("key")
+            if inward and inward != new_issue_key:
+                jira.create_issue_link(link_type, inward, new_issue_key)
+                link_results.append({"type": link_type, "from": inward, "to": new_issue_key})
+            if outward and outward != new_issue_key:
+                jira.create_issue_link(link_type, new_issue_key, outward)
+                link_results.append({"type": link_type, "from": new_issue_key, "to": outward})
+        except Exception as e:
+            link_results.append({"error": str(e), "link": link})
+    # 6. Replicar comentarios (siempre, con autor y fecha)
+    comment_results = []
+    try:
+        comments = orig_data.get("comment", {}).get("comments", [])
+        for c in comments:
+            body = c.get("body", "")
+            author = c.get("author", {}).get("displayName", "Desconocido")
+            created = c.get("created", "")
+            body_with_author = f"[Original de: {author}, {created}]\n{body}"
+            if body:
+                res = jira.add_comment(new_issue_key, body_with_author)
+                comment_results.append(res)
+    except Exception as e:
+        comment_results.append({"error": str(e)})
+    # Limpiar archivos temporales
+    shutil.rmtree(temp_dir)
+    return json.dumps({
+        "success": True,
+        "source_issue": source_issue_key,
+        "cloned_issue": new_issue_key,
+        "attachments": uploaded_attachments,
+        "links": link_results,
+        "comments": comment_results
+    }, indent=2, ensure_ascii=False)
