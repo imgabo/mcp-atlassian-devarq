@@ -2051,114 +2051,143 @@ async def create_issue_from_volume_file(
             pass
         return json.dumps({"success": False, "error": error}, indent=2, ensure_ascii=False)
 
+
 @jira_mcp.tool(tags={"jira", "write"})
-async def clone_issue_with_attachments_and_links(
+async def create_issue_with_secondary_activities(
     ctx: Context,
-    source_issue_key: Annotated[str, Field(description="Key de la tarea a clonar (ej: AT-2)")],
-    target_project_key: Annotated[str, Field(description="Proyecto destino (ej: AT)")],
-    summary_prefix: Annotated[str, Field(description="Prefijo opcional para el resumen", default="CLONE - ")] = "CLONE - "
+    project_key: Annotated[str, Field(description="Jira project key (e.g., 'PROJ')")],
+    summary: Annotated[str, Field(description="Summary/title of the main issue")],
+    issue_type: Annotated[str, Field(description="Issue type for the main issue (e.g., 'Story', 'Task')")],
+    description: Annotated[str, Field(description="Description of the main issue", default="")] = "",
+    assignee: Annotated[str, Field(description="(Optional) Assignee for the main issue", default="")] = "",
+    components: Annotated[str, Field(description="(Optional) Comma-separated list of component names", default="")] = "",
+    additional_fields: Annotated[
+        dict[str, Any],
+        Field(description="(Optional) Dictionary of additional fields for the main issue", default_factory=dict),
+    ] = {},
+    secondary_activities: Annotated[
+        list[dict],
+        Field(description="(Optional) List of dicts with all fields for each secondary activity/subtask", default_factory=list),
+    ] = [],
 ) -> str:
     """
-    Clona una tarea de Jira (issue) incluyendo descripción, adjuntos, enlaces y comentarios (con autor y fecha original).
+    Crea un issue principal (HU, Task, etc.) y, opcionalmente, una lista de subtareas (actividades secundarias),
+    cada una aceptando todos los campos posibles.
     """
- 
     lifespan_ctx = ctx.request_context.lifespan_context
+    if lifespan_ctx.read_only:
+        raise ValueError("Cannot create issue in read-only mode.")
     if not lifespan_ctx or not lifespan_ctx.jira:
-        raise Exception("Jira client is not configured or available.")
+        raise ValueError("Jira client is not configured or available.")
     jira = lifespan_ctx.jira
-    # 1. Obtener datos del issue original
-    orig_issue = jira.get_issue(issue_key=source_issue_key, fields="*all", expand="attachment,renderedFields")
-    orig_data = orig_issue.to_simplified_dict() if hasattr(orig_issue, "to_simplified_dict") else orig_issue
-    summary = orig_data.get("summary", "")
-    description = orig_data.get("description", "")
-    # Buscar imágenes embebidas en la descripción (!nombre.png! o !nombre.png|...!)
-    embedded_images = set()
-    for match in re.finditer(r"!([^!|]+)(?:\|[^!]*)?!", description):
-        fname = match.group(1)
-        embedded_images.add(fname)
-    # 2. Crear el nuevo issue (sin adjuntos aún)
-    new_summary = f"{summary_prefix}{summary}"
-    new_issue = jira.create_issue(
-        project_key=target_project_key,
-        summary=new_summary,
-        issue_type=orig_data.get("issuetype", {}).get("name", "Task"),
-        description=description,
-        assignee=orig_data.get("assignee", {}).get("accountId", "")
+
+    # Preparar componentes
+    components_list = [c.strip() for c in components.split(",") if c.strip()] if components else None
+    # Convertir descripción a Wiki Markup
+    description_wiki = jira.markdown_to_jira(description) if description else ""
+    # Crear issue principal
+    main_issue = jira.create_issue(
+        project_key=project_key,
+        summary=summary,
+        issue_type=issue_type,
+        description=description_wiki,
+        assignee=assignee,
+        components=components_list,
+        **(additional_fields or {})
     )
-    new_issue_key = getattr(new_issue, "key", None) or (new_issue.get("key") if isinstance(new_issue, dict) else None)
-    # 3. Descargar adjuntos usando la tool download_attachments
-    temp_dir = tempfile.mkdtemp()
-    attachment_results = []
-    attachment_files = []
-    attachment_names = []
-    try:
-        from src.mcp_atlassian.servers.jira import download_attachments
-        download_json = await download_attachments(ctx, source_issue_key, temp_dir)
-        download_result = json.loads(download_json)
-        attachments = download_result.get('attachments', []) if isinstance(download_result, dict) else []
-        for att in attachments:
-            file_path = att.get('file_path')
-            filename = att.get('filename')
-            if file_path and filename:
-                attachment_files.append(file_path)
-                attachment_names.append(filename)
-                attachment_results.append({"filename": filename, "success": True})
-    except Exception as e:
-        attachment_results.append({"error": str(e)})
-    # 4. Subir adjuntos al nuevo issue
-    uploaded_attachments = []
-    for file_path in attachment_files:
-        try:
-            result = jira.upload_attachment(issue_key=new_issue_key, file_path=file_path)
-            uploaded_attachments.append(result)
-        except Exception as e:
-            uploaded_attachments.append({"file": file_path, "error": str(e)})
-    # 5. Replicar enlaces (solo issue links, no web links directos)
-    issue_links = []
-    web_links = []
-    if "issuelinks" in orig_data:
-        issue_links = orig_data["issuelinks"]
-    if "issuelinks" in orig_data.get("fields", {}):
-        issue_links = orig_data["fields"]["issuelinks"]
-    if "issuelinks" in orig_data:
-        for link in orig_data["issuelinks"]:
-            if "webLink" in link:
-                web_links.append(link["webLink"])
-    link_results = []
-    for link in issue_links:
-        try:
-            link_type = link.get("type", {}).get("name")
-            inward = link.get("inwardIssue", {}).get("key")
-            outward = link.get("outwardIssue", {}).get("key")
-            if inward and inward != new_issue_key:
-                jira.create_issue_link(link_type, inward, new_issue_key)
-                link_results.append({"type": link_type, "from": inward, "to": new_issue_key})
-            if outward and outward != new_issue_key:
-                jira.create_issue_link(link_type, new_issue_key, outward)
-                link_results.append({"type": link_type, "from": new_issue_key, "to": outward})
-        except Exception as e:
-            link_results.append({"error": str(e), "link": link})
-    # 6. Replicar comentarios (siempre, con autor y fecha)
-    comment_results = []
-    try:
-        comments = orig_data.get("comment", {}).get("comments", [])
-        for c in comments:
-            body = c.get("body", "")
-            author = c.get("author", {}).get("displayName", "Desconocido")
-            created = c.get("created", "")
-            body_with_author = f"[Original de: {author}, {created}]\n{body}"
-            if body:
-                res = jira.add_comment(new_issue_key, body_with_author)
-                comment_results.append(res)
-    except Exception as e:
-        comment_results.append({"error": str(e)})
-    # Limpiar archivos temporales
-    shutil.rmtree(temp_dir)
+    main_issue_key = getattr(main_issue, "key", None) or (main_issue.get("key") if isinstance(main_issue, dict) else None)
+    if not main_issue_key:
+        raise Exception("Failed to create main issue.")
+    # Crear subtareas
+    created_subtasks = []
+    for sub in secondary_activities:
+        sub_fields = dict(sub)  # Copia para no mutar el original
+        sub_fields["issue_type"] = sub_fields.get("issue_type", "Subtask")
+        sub_fields["parent"] = main_issue_key
+        # Eliminar campos que no son de Jira.create_issue
+        project_key_sub = sub_fields.pop("project_key", project_key)
+        summary_sub = sub_fields.pop("summary", None)
+        if not summary_sub:
+            continue  # No crear si no hay summary
+        description_sub = sub_fields.pop("description", "")
+        description_sub_wiki = jira.markdown_to_jira(description_sub) if description_sub else ""
+        assignee_sub = sub_fields.pop("assignee", "")
+        components_sub = sub_fields.pop("components", "")
+        components_list_sub = [c.strip() for c in components_sub.split(",") if c.strip()] if components_sub else None
+        # Crear subtarea
+        subtask = jira.create_issue(
+            project_key=project_key_sub,
+            summary=summary_sub,
+            issue_type=sub_fields.pop("issue_type", "Subtask"),
+            description=description_sub_wiki,
+            assignee=assignee_sub,
+            components=components_list_sub,
+            parent=main_issue_key,
+            **sub_fields
+        )
+        created_subtasks.append(subtask.to_simplified_dict() if hasattr(subtask, "to_simplified_dict") else subtask)
     return json.dumps({
         "success": True,
-        "source_issue": source_issue_key,
-        "cloned_issue": new_issue_key,
-        "attachments": uploaded_attachments,
-        "links": link_results,
-        "comments": comment_results
+        "main_issue": main_issue.to_simplified_dict() if hasattr(main_issue, "to_simplified_dict") else main_issue,
+        "secondary_activities": created_subtasks
     }, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(tags={"jira", "write"})
+async def add_secondary_activity_to_issue(
+    ctx: Context,
+    parent_issue_key: Annotated[str, Field(description="Issue key of the parent (e.g., HU) to which subtasks will be added")],
+    secondary_activities: Annotated[
+        list[dict],
+        Field(description="List of dicts with all fields for each secondary activity/subtask to add. Cada subtarea debe incluir obligatoriamente los campos 'project_key' y 'summary'.", default_factory=list),
+    ] = [],
+) -> str:
+    """
+    Agrega una o más subtareas (actividades secundarias) a un issue existente, aceptando todos los campos posibles.
+    Cada subtarea debe incluir obligatoriamente los campos 'project_key' y 'summary'.
+    Si falta alguno de estos campos en alguna subtarea, se arrojará un error.
+    """
+    lifespan_ctx = ctx.request_context.lifespan_context
+    if lifespan_ctx.read_only:
+        raise ValueError("Cannot create subtasks in read-only mode.")
+    if not lifespan_ctx or not lifespan_ctx.jira:
+        raise ValueError("Jira client is not configured or available.")
+    jira = lifespan_ctx.jira
+
+    if not secondary_activities or not isinstance(secondary_activities, list):
+        raise ValueError("Debe proporcionar al menos una subtarea en 'secondary_activities'.")
+
+    created_subtasks = []
+    for idx, sub in enumerate(secondary_activities):
+        sub_fields = dict(sub)
+        project_key_sub = sub_fields.get("project_key")
+        summary_sub = sub_fields.get("summary")
+        if not project_key_sub or not summary_sub:
+            raise ValueError(f"Cada subtarea debe incluir los campos obligatorios 'project_key' y 'summary'. Faltan en la subtarea de índice {idx}.")
+        sub_fields["issue_type"] = sub_fields.get("issue_type", "Subtask")
+        # NO agregar sub_fields["parent"] = parent_issue_key
+        # Extraer y preparar campos
+        project_key_sub = sub_fields.pop("project_key")
+        summary_sub = sub_fields.pop("summary")
+        description_sub = sub_fields.pop("description", "")
+        description_sub_wiki = jira.markdown_to_jira(description_sub) if description_sub else ""
+        assignee_sub = sub_fields.pop("assignee", "")
+        components_sub = sub_fields.pop("components", "")
+        components_list_sub = [c.strip() for c in components_sub.split(",") if components_sub and c.strip()] if components_sub else None
+        subtask = jira.create_issue(
+            project_key=project_key_sub,
+            summary=summary_sub,
+            issue_type=sub_fields.pop("issue_type", "Subtask"),
+            description=description_sub_wiki,
+            assignee=assignee_sub,
+            components=components_list_sub,
+            parent=parent_issue_key,
+            **sub_fields
+        )
+        created_subtasks.append(subtask.to_simplified_dict() if hasattr(subtask, "to_simplified_dict") else subtask)
+    return json.dumps({
+        "success": True,
+        "parent_issue_key": parent_issue_key,
+        "secondary_activities": created_subtasks
+    }, indent=2, ensure_ascii=False)
+#   
